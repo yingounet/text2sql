@@ -1,0 +1,28 @@
+# Binaries
+/server
+/cmd/server/server
+
+# Data
+/data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Config with secrets (optional)
+config.local.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go
+*.test
+*.out
+
+# Build outputs
+/text2sql
+/text2sql-linux
+/text2sql-macos
+/text2sql.exe
