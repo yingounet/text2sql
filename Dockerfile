@@ -3,14 +3,6 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
-# Install git (required for go mod download)
-RUN apk add --no-cache git
-
-# 设置中国镜像源
-ENV GOPROXY=https://goproxy.cn,direct
-ENV GOSUMDB=sum.golang.google.cn
-ENV GOPRIVATE=
-
 COPY go.mod ./
 RUN go mod download
 

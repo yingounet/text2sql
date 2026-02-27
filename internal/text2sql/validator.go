@@ -105,7 +105,7 @@ func (v *SQLValidator) ensureReadOnlySQL(sql string) error {
 
 func isReadOnlyStatement(stmt sqlparser.Statement) bool {
 	switch stmt.(type) {
-	case *sqlparser.Select, *sqlparser.Union, *sqlparser.ParenSelect, *sqlparser.With:
+	case *sqlparser.Select, *sqlparser.Union, *sqlparser.ParenSelect:
 		return true
 	default:
 		return false
