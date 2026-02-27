@@ -16,7 +16,7 @@ concurrency:
 
 env:
   # Docker Hub 仓库名（修改为你的用户名/仓库名）
-  IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/slimurl
+  IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/text2sql
 
 jobs:
   build-and-push:
