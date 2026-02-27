@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  text2sql:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - API_KEY=${API_KEY:-your-secret-api-key}
+      - CONFIG_PATH=/app/config.yaml
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - text2sql_data:/app/data
+
+volumes:
+  text2sql_data:
