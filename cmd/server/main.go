@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,31 +14,44 @@ import (
 
 	"text2sql/internal/api"
 	"text2sql/internal/config"
+	"text2sql/internal/llm"
 	"text2sql/internal/llmfactory"
+	"text2sql/internal/logger"
 	"text2sql/internal/text2sql"
 )
 
 func main() {
+	logHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+	logger.SetLogger(slog.New(logHandler))
+
 	cfg, err := config.LoadFromEnv()
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		logger.Error("load config failed", "error", err)
+		os.Exit(1)
 	}
 
-	if cfg.APIKey == "" {
-		log.Fatal("api_key 未配置，请设置 config.api_key 或环境变量 API_KEY")
+	if len(cfg.APIKeys) == 0 {
+		logger.Error("api_key 未配置")
+		os.Exit(1)
 	}
 
 	llmProvider, err := llmfactory.NewProviderFromConfig(&cfg.LLM)
 	if err != nil {
-		log.Fatalf("create llm provider: %v", err)
+		logger.Error("create llm provider failed", "error", err)
+		os.Exit(1)
 	}
+
+	cachedProvider := llm.NewCachedProvider(llmProvider, 5*time.Minute)
 
 	var store text2sql.ContextStore
 	switch cfg.ContextStore {
 	case "sqlite":
 		sqliteStore, err := text2sql.NewSQLiteContextStore(cfg.Database.DSN)
 		if err != nil {
-			log.Fatalf("create sqlite context store: %v", err)
+			logger.Error("create sqlite context store failed", "error", err)
+			os.Exit(1)
 		}
 		store = sqliteStore
 	default:
@@ -46,9 +59,9 @@ func main() {
 	}
 
 	validator := text2sql.NewSQLValidator()
-	svc := text2sql.NewServiceWithContextStore(llmProvider, validator, 2, store)
+	svc := text2sql.NewServiceWithContextStore(cachedProvider, validator, 2, store)
 
-	handler := api.NewHandler(svc, cfg.APIKey)
+	handler := api.NewHandler(svc, cfg.APIKeys)
 
 	r := chi.NewRouter()
 	handler.Routes(r)
@@ -62,29 +75,28 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// 优雅关闭
 	go func() {
 		sigint := make(chan os.Signal, 1)
 		signal.Notify(sigint, os.Interrupt, syscall.SIGTERM)
 		<-sigint
-		log.Println("Shutting down server...")
+		logger.Info("Shutting down server...")
 
-		// 关闭 ContextStore
 		if err := store.Close(); err != nil {
-			log.Printf("Error closing context store: %v", err)
+			logger.Error("Error closing context store", "error", err)
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("Server shutdown error: %v", err)
+			logger.Error("Server shutdown error", "error", err)
 		} else {
-			log.Println("Server gracefully stopped")
+			logger.Info("Server gracefully stopped")
 		}
 	}()
 
-	log.Printf("server listening on %s", addr)
+	logger.Info("server listening", "addr", addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server: %v", err)
+		logger.Error("server error", "error", err)
+		os.Exit(1)
 	}
 }

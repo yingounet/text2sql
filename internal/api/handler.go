@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-playground/validator/v10"
@@ -14,26 +15,32 @@ import (
 
 // Handler API 处理器
 type Handler struct {
-	text2sql *text2sql.Service
-	apiKey   string
-	validate *validator.Validate
+	text2sql    *text2sql.Service
+	apiKeys     map[string]bool
+	validate    *validator.Validate
+	rateLimiter *RateLimiter
 }
 
 const maxRequestBodyBytes int64 = 1 << 20 // 1MB
 
 // NewHandler 创建 Handler
-func NewHandler(text2sql *text2sql.Service, apiKey string) *Handler {
+func NewHandler(text2sql *text2sql.Service, apiKeys []string) *Handler {
+	keyMap := make(map[string]bool)
+	for _, key := range apiKeys {
+		keyMap[key] = true
+	}
 	return &Handler{
-		text2sql: text2sql,
-		apiKey:   apiKey,
-		validate: validator.New(),
+		text2sql:    text2sql,
+		apiKeys:     keyMap,
+		validate:    validator.New(),
+		rateLimiter: NewRateLimiter(10, time.Minute), // 每分钟10个请求
 	}
 }
 
 // Routes 注册路由
 func (h *Handler) Routes(r chi.Router) {
 	r.Get("/api/v1/health", h.Health)
-	r.With(h.authMiddleware).Post("/api/v1/sql/generate", h.Generate)
+	r.With(h.authMiddleware, h.rateLimitMiddleware).Post("/api/v1/sql/generate", h.Generate)
 }
 
 // authMiddleware API Key 认证
@@ -44,7 +51,7 @@ func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "缺少 API Key")
 			return
 		}
-		if key != h.apiKey {
+		if !h.apiKeys[key] {
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "API Key 无效")
 			return
 		}
@@ -65,7 +72,17 @@ func extractAPIKey(r *http.Request) string {
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	health := map[string]interface{}{
+		"status":    "ok",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"checks": map[string]interface{}{
+			"service": map[string]string{
+				"status": "ok",
+			},
+		},
+	}
+	json.NewEncoder(w).Encode(health)
 }
 
 // Generate 生成 SQL

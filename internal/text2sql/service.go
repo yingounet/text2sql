@@ -6,18 +6,18 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
 	"text2sql/internal/llm"
+	"text2sql/internal/logger"
 )
 
 // Service Text2SQL 核心服务
 type Service struct {
-	llm         llm.Provider
-	validator   *SQLValidator
-	maxRetries  int
+	llm          llm.Provider
+	validator    *SQLValidator
+	maxRetries   int
 	contextStore ContextStore
 }
 
@@ -60,10 +60,10 @@ func NewServiceWithContextStore(llmProvider llm.Provider, validator *SQLValidato
 // 多轮对话时，提供有效的 conversation_id 时 schema 和 database 可选，从上下文复用
 type GenerateRequest struct {
 	Query          string   `json:"query" validate:"required"`
-	Schema         Schema   `json:"schema,omitempty"`           // 可选：续会话时可省略，从上下文读取
-	Database       Database `json:"database,omitempty"`         // 可选：续会话时可省略，从上下文读取
-	ConversationID string   `json:"conversation_id,omitempty"`  // 可选：会话ID，用于关联上下文
-	PreviousSQL    string   `json:"previous_sql,omitempty"`     // 可选：上一轮SQL，用于追加修改
+	Schema         Schema   `json:"schema,omitempty"`          // 可选：续会话时可省略，从上下文读取
+	Database       Database `json:"database,omitempty"`        // 可选：续会话时可省略，从上下文读取
+	ConversationID string   `json:"conversation_id,omitempty"` // 可选：会话ID，用于关联上下文
+	PreviousSQL    string   `json:"previous_sql,omitempty"`    // 可选：上一轮SQL，用于追加修改
 }
 
 // Schema 表结构
@@ -99,24 +99,53 @@ type GenerateResponse struct {
 
 // Generate 根据自然语言和表结构生成 SQL
 func (s *Service) Generate(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
+	// 1. 加载或创建会话上下文
+	convCtx, conversationID, err := s.loadOrCreateContext(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. 确定使用的 schema 和 database
+	schema, database := s.resolveSchemaAndDatabase(req, convCtx)
+
+	// 3. 确定使用的 previous_sql
+	previousSQL := s.resolvePreviousSQL(req, convCtx)
+
+	// 4. 构建 LLM 消息
+	messages := s.buildMessages(req, schema, database, previousSQL, convCtx)
+
+	// 5. 调用 LLM 生成 SQL
+	sql, explanation, err := s.callLLMWithRetry(ctx, messages, database)
+	if err != nil {
+		return nil, err
+	}
+
+	// 6. 保存上下文
+	s.saveContext(convCtx, conversationID, schema, database, req.Query, sql, explanation)
+
+	return &GenerateResponse{
+		SQL:            sql,
+		Explanation:    explanation,
+		ConversationID: conversationID,
+	}, nil
+}
+
+// loadOrCreateContext 加载或创建会话上下文
+func (s *Service) loadOrCreateContext(req *GenerateRequest) (*ConversationContext, string, error) {
 	var conversationID string
-	var previousSQL string
 	var convCtx *ConversationContext
 	var schema Schema
 	var database Database
 
-	// 1. 处理会话ID和上下文加载
 	if req.ConversationID != "" {
-		// 尝试加载历史上下文
 		loadedCtx, err := s.contextStore.Get(req.ConversationID)
 		if err == nil {
 			convCtx = loadedCtx
 			conversationID = req.ConversationID
-			// 续会话：schema/database 可从上下文复用
 			if len(req.Schema.Tables) > 0 {
 				schema = req.Schema
 				if !s.schemaEqual(convCtx.Schema, req.Schema) {
-					return nil, fmt.Errorf("%w: schema 与历史会话不一致", ErrSchemaMismatch)
+					return nil, "", fmt.Errorf("%w: schema 与历史会话不一致", ErrSchemaMismatch)
 				}
 			} else {
 				schema = convCtx.Schema
@@ -124,50 +153,77 @@ func (s *Service) Generate(ctx context.Context, req *GenerateRequest) (*Generate
 			if req.Database.Type != "" {
 				database = req.Database
 				if convCtx.Database.Type != req.Database.Type || convCtx.Database.Version != req.Database.Version {
-					return nil, fmt.Errorf("%w: database 与历史会话不一致", ErrDatabaseMismatch)
+					return nil, "", fmt.Errorf("%w: database 与历史会话不一致", ErrDatabaseMismatch)
 				}
 			} else {
 				database = convCtx.Database
 			}
-			// 如果历史中有SQL，使用最新的SQL作为previous_sql
-			if len(convCtx.History) > 0 && req.PreviousSQL == "" {
-				previousSQL = convCtx.History[len(convCtx.History)-1].SQL
-			}
 		} else if err == ErrConversationNotFound {
-			// 会话不存在，按新会话处理，需要 schema 和 database
 			conversationID = generateConversationID()
 			if len(req.Schema.Tables) == 0 {
-				return nil, fmt.Errorf("%w: conversation_id 无效或已过期，请提供 schema", ErrSchemaRequired)
+				return nil, "", fmt.Errorf("%w: conversation_id 无效或已过期，请提供 schema", ErrSchemaRequired)
 			}
 			if req.Database.Type == "" {
-				return nil, fmt.Errorf("%w: conversation_id 无效或已过期，请提供 database", ErrDatabaseRequired)
+				return nil, "", fmt.Errorf("%w: conversation_id 无效或已过期，请提供 database", ErrDatabaseRequired)
 			}
 			schema = req.Schema
 			database = req.Database
 		} else {
-			return nil, fmt.Errorf("加载上下文失败: %w", err)
+			return nil, "", fmt.Errorf("加载上下文失败: %w", err)
 		}
 	} else {
-		// 创建新会话，schema 和 database 必填
 		conversationID = generateConversationID()
 		if len(req.Schema.Tables) == 0 {
-			return nil, fmt.Errorf("%w: 新会话需提供 schema", ErrSchemaRequired)
+			return nil, "", fmt.Errorf("%w: 新会话需提供 schema", ErrSchemaRequired)
 		}
 		if req.Database.Type == "" {
-			return nil, fmt.Errorf("%w: 新会话需提供 database", ErrDatabaseRequired)
+			return nil, "", fmt.Errorf("%w: 新会话需提供 database", ErrDatabaseRequired)
 		}
 		schema = req.Schema
 		database = req.Database
 	}
 
-	// 2. 如果直接提供了 previous_sql，优先使用
-	if req.PreviousSQL != "" {
-		previousSQL = req.PreviousSQL
+	if convCtx == nil {
+		convCtx = &ConversationContext{
+			ConversationID: conversationID,
+			Schema:         schema,
+			Database:       database,
+			History:        []ConversationTurn{},
+			CreatedAt:      time.Now(),
+			UpdatedAt:      time.Now(),
+		}
 	}
 
-	// 3. 构建 Prompt
+	return convCtx, conversationID, nil
+}
+
+// resolveSchemaAndDatabase 确定使用的 schema 和 database
+func (s *Service) resolveSchemaAndDatabase(req *GenerateRequest, convCtx *ConversationContext) (Schema, Database) {
+	if len(req.Schema.Tables) > 0 {
+		return req.Schema, req.Database
+	}
+	if convCtx != nil {
+		return convCtx.Schema, convCtx.Database
+	}
+	return req.Schema, req.Database
+}
+
+// resolvePreviousSQL 确定使用的 previous_sql
+func (s *Service) resolvePreviousSQL(req *GenerateRequest, convCtx *ConversationContext) string {
+	if req.PreviousSQL != "" {
+		return req.PreviousSQL
+	}
+	if convCtx != nil && len(convCtx.History) > 0 {
+		return convCtx.History[len(convCtx.History)-1].SQL
+	}
+	return ""
+}
+
+// buildMessages 构建 LLM 消息列表
+func (s *Service) buildMessages(req *GenerateRequest, schema Schema, database Database, previousSQL string, convCtx *ConversationContext) []llm.Message {
 	var systemPrompt string
 	var userContent string
+
 	if database.Type == "redis" {
 		if previousSQL != "" {
 			systemPrompt = buildSystemPromptForModifyRedis(database.Version)
@@ -191,9 +247,7 @@ func (s *Service) Generate(ctx context.Context, req *GenerateRequest) (*Generate
 		{Role: "user", Content: userContent},
 	}
 
-	// 4. 如果有历史上下文，添加历史对话（可选，用于更好的上下文理解）
 	if convCtx != nil && len(convCtx.History) > 0 && previousSQL == "" {
-		// 添加最近几轮历史对话（最多3轮）
 		startIdx := len(convCtx.History) - 3
 		if startIdx < 0 {
 			startIdx = 0
@@ -205,13 +259,17 @@ func (s *Service) Generate(ctx context.Context, req *GenerateRequest) (*Generate
 				llm.Message{Role: "assistant", Content: fmt.Sprintf("SQL: %s\n解释: %s", turn.SQL, turn.Explanation)},
 			)
 		}
-		// 添加当前查询
 		messages = append(messages, llm.Message{Role: "user", Content: req.Query})
 	}
 
-	// 5. 调用 LLM 生成 SQL
+	return messages
+}
+
+// callLLMWithRetry 调用 LLM 并重试
+func (s *Service) callLLMWithRetry(ctx context.Context, messages []llm.Message, database Database) (string, string, error) {
 	var lastValidationErr error
 	var sql, explanation string
+
 	for attempt := 0; attempt < s.maxRetries; attempt++ {
 		resp, err := s.llm.Complete(ctx, &llm.CompleteRequest{
 			Model:       "",
@@ -220,7 +278,7 @@ func (s *Service) Generate(ctx context.Context, req *GenerateRequest) (*Generate
 			Temperature: 0.1,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("%w: llm complete: %w", ErrLLMError, err)
+			return "", "", fmt.Errorf("%w: llm complete: %w", ErrLLMError, err)
 		}
 
 		if database.Type == "redis" {
@@ -229,7 +287,6 @@ func (s *Service) Generate(ctx context.Context, req *GenerateRequest) (*Generate
 			sql, explanation = parseLLMOutput(resp.Content)
 		}
 
-		// 校验（SQL 或 Redis 命令）
 		if err := s.validator.Validate(sql, database.Type, database.Version); err != nil {
 			lastValidationErr = err
 			if attempt < s.maxRetries-1 {
@@ -243,44 +300,33 @@ func (s *Service) Generate(ctx context.Context, req *GenerateRequest) (*Generate
 				)
 				continue
 			}
-			return nil, fmt.Errorf("%w: %v", ErrSQLValidation, err)
+			return "", "", fmt.Errorf("%w: %v", ErrSQLValidation, err)
 		}
 
 		break
 	}
 
 	if sql == "" {
-		return nil, fmt.Errorf("%w: %v", ErrSQLValidation, lastValidationErr)
+		return "", "", fmt.Errorf("%w: %v", ErrSQLValidation, lastValidationErr)
 	}
 
-	// 6. 保存上下文
-	if convCtx == nil {
-		convCtx = &ConversationContext{
-			ConversationID: conversationID,
-			Schema:         schema,
-			Database:       database,
-			History:        []ConversationTurn{},
-			CreatedAt:      time.Now(),
-			UpdatedAt:      time.Now(),
-		}
-	}
+	return sql, explanation, nil
+}
+
+// saveContext 保存会话上下文
+func (s *Service) saveContext(convCtx *ConversationContext, conversationID string, schema Schema, database Database, query, sql, explanation string) {
 	convCtx.History = append(convCtx.History, ConversationTurn{
-		Query:       req.Query,
+		Query:       query,
 		SQL:         sql,
 		Explanation: explanation,
 		Timestamp:   time.Now(),
 	})
-	if err := s.contextStore.Save(convCtx); err != nil {
-		// 保存失败不影响返回结果，只记录错误
-		// 注意：在生产环境中应使用结构化日志库
-		log.Printf("保存上下文失败: conversation_id=%s, error=%v", conversationID, err)
-	}
 
-	return &GenerateResponse{
-		SQL:            sql,
-		Explanation:    explanation,
-		ConversationID: conversationID,
-	}, nil
+	if err := s.contextStore.Save(convCtx); err != nil {
+		logger.Error("保存上下文失败",
+			"conversation_id", conversationID,
+			"error", err)
+	}
 }
 
 // generateConversationID 生成会话ID
